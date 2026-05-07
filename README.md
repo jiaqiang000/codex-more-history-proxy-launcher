@@ -18,6 +18,7 @@ Codex 聊天记录，Codex 历史记录，Codex 只显示 50 条，Codex 显示 
 - 把 Codex 侧边栏聊天记录从默认 50 个提高到 5000 个。
 - 给 Codex 单独设置 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 等代理环境变量。
 - 只影响这次脚本启动出来的 Codex，不污染当前终端，也不永久修改系统代理。
+- 默认前台启动，终端会一直挂着并继续显示 Codex 日志，这样能直观看到这次启动的代理环境还跟着 Codex 进程在跑。
 - 如果 Codex 更新后内部结构变了，脚本会直接失败退出，并关闭这次启动的 Codex，避免启动出一个半坏不坏的状态。
 - 禁止用 `source` 执行，必须用 `bash` 执行，避免把当前 shell 替换掉。
 
@@ -31,6 +32,8 @@ Codex 聊天记录，Codex 历史记录，Codex 只显示 50 条，Codex 显示 
 ```bash
 bash ./launch_codex_with_proxy_and_all_threads.sh
 ```
+
+启动成功后，终端默认不会立刻回到命令行，而是会继续挂着显示 Codex 的运行日志。这个行为是故意的：这样你可以确认这次启动的 Codex 还在当前代理环境下运行。
 
 默认配置是：
 
@@ -59,6 +62,13 @@ bash ./launch_codex_with_proxy_and_all_threads.sh
 ```bash
 CODEX_PROXY=http://127.0.0.1:7891 \
 CODEX_THREAD_LIST_LIMIT=2000 \
+bash ./launch_codex_with_proxy_and_all_threads.sh
+```
+
+如果你不想占用终端，也可以改成后台启动：
+
+```bash
+CODEX_BACKGROUND=1 \
 bash ./launch_codex_with_proxy_and_all_threads.sh
 ```
 

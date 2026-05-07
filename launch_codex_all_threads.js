@@ -24,6 +24,7 @@ const CDP_COMMAND_TIMEOUT_MS = Number.parseInt(
 );
 const PROXY = process.env.CODEX_PROXY || "http://127.0.0.1:7890";
 const NO_PROXY_LIST = process.env.CODEX_NO_PROXY || "127.0.0.1,localhost";
+const BACKGROUND = process.env.CODEX_BACKGROUND === "1";
 
 if (!Number.isFinite(DEBUG_PORT) || DEBUG_PORT <= 0) {
   throw new Error(`Invalid CODEX_REMOTE_DEBUG_PORT: ${DEBUG_PORT}`);
@@ -125,15 +126,16 @@ function launchCodex() {
     proxy: PROXY || null,
     noProxy: NO_PROXY_LIST || null,
     threadLimit: THREAD_LIMIT,
+    mode: BACKGROUND ? "background" : "foreground",
   });
 
   const child = spawn(
     APP_BIN,
     [`--remote-debugging-port=${DEBUG_PORT}`],
     {
-      detached: true,
+      detached: BACKGROUND,
       env: childEnv,
-      stdio: "ignore",
+      stdio: BACKGROUND ? "ignore" : "inherit",
     },
   );
 
@@ -148,7 +150,9 @@ function launchCodex() {
     pid: child.pid ?? null,
   });
 
-  child.unref();
+  if (BACKGROUND) {
+    child.unref();
+  }
   return child;
 }
 
@@ -585,6 +589,22 @@ async function main() {
     console.log(
       `Codex launched with one-shot thread list patch. limit=${result.limit} proxy=${PROXY || "disabled"} url=${result.patchedUrl}`,
     );
+    if (!BACKGROUND) {
+      log("INFO", "Codex is running in foreground; terminal will stay attached", {
+        pid: child.pid ?? null,
+      });
+      await new Promise((resolve, reject) => {
+        child.once("exit", (code, signal) => {
+          log("INFO", "Codex process exited", { code, signal });
+          if (code === 0 || signal != null) {
+            resolve();
+            return;
+          }
+          reject(new Error(`Codex exited with code ${code}`));
+        });
+        child.once("error", reject);
+      });
+    }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     log("ERROR", "launcher failed", { reason });
