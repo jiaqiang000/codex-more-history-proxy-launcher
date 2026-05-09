@@ -1,6 +1,6 @@
 # Codex 显示更多聊天记录 + 代理启动脚本
 
-Codex 桌面端侧边栏默认只展示最近 50 个聊天记录。这个脚本的作用很直接：用它启动 Codex 后，可以把侧边栏聊天记录数量提高到 5000 个，同时给这一次启动出来的 Codex 单独设置本地 HTTP(S) 代理,解决Reconnecting问题。。
+Codex 桌面端侧边栏默认只展示最近 50 个聊天记录。这个脚本的作用很直接：用它启动 Codex 后，可以把侧边栏聊天记录数量提高到 5000 个，同时给这一次启动出来的 Codex 单独设置本地 HTTP(S) 代理，减少 reconnecting 和接口连接不稳的问题。
 
 我写这个脚本主要是为了解决两个实际问题：
 
@@ -25,7 +25,7 @@ Codex 聊天记录，Codex 历史记录，Codex 只显示 50 条，Codex 显示 
 ## 文件说明
 
 - `launch_codex_with_proxy_and_all_threads.sh`：入口脚本，负责设置代理环境变量，然后启动真正的 Node.js launcher。
-- `launch_codex_all_threads.js`：负责启动 Codex、连接 Electron DevTools Protocol，并在运行时把聊天记录加载数量提高到 5000。
+- `launch_codex_all_threads.js`：负责启动 Codex、连接 Electron DevTools Protocol，并在页面启动时把 `thread/list` 请求里的 `limit` 从 50 改成 5000。
 
 ## 使用方式
 
@@ -81,7 +81,7 @@ bash ./launch_codex_with_proxy_and_all_threads.sh
 
 ## 注意事项
 
-这个脚本依赖 Codex 桌面端内部前端实现。Codex 更新后，内部模块名或方法名可能变化，脚本也可能需要跟着调整。
+这个脚本依赖 Codex 桌面端内部前端实现。Codex 更新后，如果前端消息路由或 `thread/list` 请求结构变化，脚本也可能需要跟着调整。
 
 脚本的策略是：如果补丁装不上，就直接退出并关闭这次启动的 Codex。这样至少不会因为脚本问题导致后续状态乱掉。
 

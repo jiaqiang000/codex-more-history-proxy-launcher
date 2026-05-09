@@ -61,40 +61,99 @@ function getAppAsarPath() {
   );
 }
 
-function getCandidateAppServerManagerAssetUrls() {
+function readAppAsar() {
   const asarPath = getAppAsarPath();
   const buffer = fs.readFileSync(asarPath);
   const headerSize = buffer.readUInt32LE(12);
+  const pickleSize = buffer.readUInt32LE(4);
   const header = JSON.parse(
     buffer.subarray(16, 16 + headerSize).toString("utf8"),
   );
-  const urls = [];
+  return {
+    asarPath,
+    buffer,
+    contentStart: 8 + pickleSize,
+    header,
+  };
+}
 
-  const walk = (node, prefix = "") => {
-    if (node.files) {
-      for (const [name, child] of Object.entries(node.files)) {
-        walk(child, prefix ? `${prefix}/${name}` : name);
-      }
+function walkAsarFiles(node, visit, prefix = "") {
+  if (node.files) {
+    for (const [name, child] of Object.entries(node.files)) {
+      walkAsarFiles(child, visit, prefix ? `${prefix}/${name}` : name);
+    }
+    return;
+  }
+
+  visit(prefix, node);
+}
+
+function readAsarText(asar, filePath, node) {
+  return asar.buffer
+    .subarray(
+      asar.contentStart + Number(node.offset),
+      asar.contentStart + Number(node.offset) + node.size,
+    )
+    .toString("utf8");
+}
+
+function getPatchCompatibilityInfo() {
+  const asar = readAppAsar();
+  const appServerManagerAssets = [];
+  let checkedAssetCount = 0;
+  let hasMcpRequest = false;
+  let hasSendMessageFromView = false;
+  let hasThreadList = false;
+  let vscodeApiAssetPath = null;
+
+  walkAsarFiles(asar.header, (filePath, node) => {
+    if (!/^webview\/assets\/.*\.js$/.test(filePath)) {
       return;
     }
 
-    if (/^webview\/assets\/app-server-manager-.*\.js$/.test(prefix)) {
-      urls.push(`app://-/${prefix.replace(/^webview\//, "")}`);
+    checkedAssetCount += 1;
+    if (/^webview\/assets\/vscode-api-.*\.js$/.test(filePath)) {
+      vscodeApiAssetPath = filePath;
     }
-  };
+    if (/^webview\/assets\/app-server-manager-.*\.js$/.test(filePath)) {
+      appServerManagerAssets.push(filePath);
+    }
 
-  walk(header);
-  urls.sort((left, right) => {
-    const score = (url) =>
-      url.includes("-signals-") ? 0 : url.includes("-hooks-") ? 1 : 2;
-    return score(left) - score(right) || left.localeCompare(right);
+    const text = readAsarText(asar, filePath, node);
+    hasMcpRequest ||= text.includes("mcp-request");
+    hasSendMessageFromView ||= text.includes("sendMessageFromView");
+    hasThreadList ||= text.includes("thread/list");
   });
 
-  if (urls.length === 0) {
-    throw new Error(`No app-server-manager assets found in ${asarPath}`);
+  const missing = [];
+  if (!vscodeApiAssetPath) {
+    missing.push("vscode-api asset");
+  }
+  if (!hasMcpRequest) {
+    missing.push("mcp-request dispatch path");
+  }
+  if (!hasSendMessageFromView) {
+    missing.push("sendMessageFromView bridge path");
+  }
+  if (!hasThreadList) {
+    missing.push("thread/list request path");
+  }
+  if (appServerManagerAssets.length === 0) {
+    missing.push("app-server-manager asset");
   }
 
-  return { asarPath, urls };
+  if (missing.length > 0) {
+    throw new Error(
+      `Codex app bundle no longer exposes expected patch surface: ${missing.join(", ")}`,
+    );
+  }
+
+  return {
+    asarPath: asar.asarPath,
+    checkedAssetCount,
+    appServerManagerAssets,
+    vscodeApiUrl: `app://-/${vscodeApiAssetPath.replace(/^webview\//, "")}`,
+  };
 }
 
 async function fetchJson(url) {
@@ -370,224 +429,261 @@ function createCdpClient(wsUrl) {
   });
 }
 
-function buildRuntimePrototypePatchExpression(url) {
+function buildRouterDispatchPatchSource(vscodeApiUrl) {
   return `
-(async () => {
+(() => {
   const limit = ${THREAD_LIMIT};
-  const moduleUrl = ${JSON.stringify(url)};
-  const mod = await import(moduleUrl);
-  const patchedManagers = [];
-
-  const patchRecentConversations = (manager) => {
-    const recentConversations = manager?.recentConversations;
-    if (recentConversations == null) {
-      return false;
-    }
-    if (recentConversations.__codexAllThreadsPatched === limit) {
-      return false;
-    }
-
-    const originalListRecentThreads = recentConversations.listRecentThreads;
-    if (typeof originalListRecentThreads !== "function") {
-      return false;
-    }
-
-    Object.defineProperty(recentConversations, "__codexAllThreadsPatched", {
-      value: limit,
-      configurable: true,
-    });
-    Object.defineProperty(
-      recentConversations,
-      "__codexAllThreadsOriginalListRecentThreads",
-      {
-        value: originalListRecentThreads,
-        configurable: true,
-      },
-    );
-
-    recentConversations.listRecentThreads = function listRecentThreads(params = {}) {
-      const requestedLimit = Number(params.limit) || 0;
-      return originalListRecentThreads.call(this, {
-        ...params,
-        limit: Math.max(requestedLimit, limit),
-      });
-    };
-
-    return true;
-  };
-
-  const queueRefreshIfNeeded = (manager) => {
-    if (manager == null || manager.__codexAllThreadsRefreshQueued === true) {
-      return;
-    }
-    if (typeof manager.refreshRecentConversations !== "function") {
-      return;
-    }
-
-    const recentConversations = manager.recentConversations;
-    const hasMore =
-      typeof recentConversations?.hasMoreRecentConversations === "function"
-        ? recentConversations.hasMoreRecentConversations()
-        : true;
-    if (!hasMore) {
-      return;
-    }
-
-    Object.defineProperty(manager, "__codexAllThreadsRefreshQueued", {
-      value: true,
-      configurable: true,
-    });
-    Promise.resolve().then(() => {
-      manager.refreshRecentConversations().catch((error) => {
-        window.__codexAllThreadsRefreshError = String(error);
-      });
-    });
-  };
-
-  const wrap = (proto, methodName) => {
-    const original = proto?.[methodName];
-    if (typeof original !== "function" || original.__codexAllThreadsWrapped) {
-      return false;
-    }
-
-    const wrapped = function wrappedCodexAllThreadsMethod(...args) {
-      patchRecentConversations(this);
-      if (methodName === "getRecentConversations") {
-        queueRefreshIfNeeded(this);
-      }
-      return original.apply(this, args);
-    };
-    Object.defineProperty(wrapped, "__codexAllThreadsWrapped", {
-      value: true,
-      configurable: true,
-    });
-    proto[methodName] = wrapped;
-    return true;
-  };
-
-  for (const [key, value] of Object.entries(mod)) {
-    const proto = value?.prototype;
-    const isAppServerManager =
-      proto != null &&
-      typeof proto.refreshRecentConversations === "function" &&
-      typeof proto.runRecentConversationRefresh === "function" &&
-      typeof proto.loadMoreRecentConversations === "function" &&
-      typeof proto.getRecentConversations === "function";
-
-    if (!isAppServerManager) {
-      continue;
-    }
-
-    const wrappedMethods = [
-      "refreshRecentConversations",
-      "runRecentConversationRefresh",
-      "loadMoreRecentConversations",
-      "getRecentConversations",
-      "hasMoreRecentConversations",
-    ].filter((methodName) => wrap(proto, methodName));
-
-    patchedManagers.push({
-      key,
-      name: value.name || null,
-      wrappedMethods,
-    });
+  const apiUrl = ${JSON.stringify(vscodeApiUrl)};
+  const stateKey = "__codexAllThreadsPatchInfo";
+  const existing = window[stateKey];
+  if (
+    existing?.limit === limit &&
+    existing?.patchKind === "router-dispatch-rewrite"
+  ) {
+    return existing;
   }
 
-  if (patchedManagers.length === 0) {
-    return {
-      limit,
-      patchKind: "runtime-prototype",
-      url: moduleUrl,
-      patched: false,
-      reason: "No matching AppServerManager export found",
-      exportKeys: Object.keys(mod).slice(0, 100),
-    };
-  }
-
-  window.__codexAllThreadsPatchInfo = {
+  const info = {
     limit,
-    patchKind: "runtime-prototype",
-    url: moduleUrl,
-    patchedManagers,
+    patchKind: "router-dispatch-rewrite",
+    apiUrl,
+    installed: false,
+    installError: null,
+    installAttempts: 0,
+    rewriteCount: 0,
+    lastRewrite: null,
+    routerExportKey: null,
   };
-  return window.__codexAllThreadsPatchInfo;
+  window[stateKey] = info;
+
+  const rewritePayload = (type, payload) => {
+    if (type !== "mcp-request") {
+      return payload;
+    }
+
+    const request = payload?.request;
+    if (request?.method !== "thread/list") {
+      return payload;
+    }
+
+    const params = request.params;
+    if (
+      params == null ||
+      typeof params !== "object" ||
+      params.archived !== false
+    ) {
+      return payload;
+    }
+
+    const currentLimit = Number(params.limit);
+    if (
+      !Number.isFinite(currentLimit) ||
+      currentLimit <= 0 ||
+      currentLimit >= limit
+    ) {
+      return payload;
+    }
+
+    const nextPayload = {
+      ...payload,
+      request: {
+        ...request,
+        params: {
+          ...params,
+          limit,
+        },
+      },
+    };
+    info.rewriteCount += 1;
+    info.lastRewrite = {
+      requestId: String(request.id || ""),
+      method: request.method,
+      from: currentLimit,
+      to: limit,
+      at: new Date().toISOString(),
+    };
+    return nextPayload;
+  };
+  window.__codexAllThreadsRewritePayload = rewritePayload;
+
+  const install = async () => {
+    info.installAttempts += 1;
+    try {
+      const api = await import(apiUrl);
+      let router = null;
+      let routerExportKey = null;
+
+      for (const [key, value] of Object.entries(api)) {
+        if (typeof value?.getInstance !== "function") {
+          continue;
+        }
+
+        const candidate = value.getInstance();
+        if (
+          candidate != null &&
+          typeof candidate.dispatchMessage === "function" &&
+          typeof candidate.subscribe === "function"
+        ) {
+          router = candidate;
+          routerExportKey = key;
+          break;
+        }
+      }
+
+      if (router == null) {
+        throw new Error("Codex message router export was not found");
+      }
+
+      if (router.dispatchMessage.__codexAllThreadsPatched === limit) {
+        info.installed = true;
+        info.routerExportKey = routerExportKey;
+        return info;
+      }
+
+      const original = router.dispatchMessage;
+      const wrapped = function codexAllThreadsDispatchMessage(
+        type,
+        payload,
+        ...rest
+      ) {
+        return original.call(this, type, rewritePayload(type, payload), ...rest);
+      };
+      Object.defineProperty(wrapped, "__codexAllThreadsPatched", {
+        value: limit,
+        configurable: true,
+      });
+      Object.defineProperty(wrapped, "__codexAllThreadsOriginal", {
+        value: original,
+        configurable: true,
+      });
+      router.dispatchMessage = wrapped;
+
+      info.installed = true;
+      info.installedAt = new Date().toISOString();
+      info.routerExportKey = routerExportKey;
+      return info;
+    } catch (error) {
+      info.installError = String(error?.message || error);
+      return info;
+    }
+  };
+
+  window.__codexAllThreadsPatchReady = install();
+  return info;
 })()
 `;
 }
 
-async function injectPatch() {
+async function readRuntimePatchInfo(client) {
+  const result = await client.send("Runtime.evaluate", {
+    expression:
+      "window.__codexAllThreadsPatchReady ? window.__codexAllThreadsPatchReady.then(() => window.__codexAllThreadsPatchInfo ?? null) : (window.__codexAllThreadsPatchInfo ?? null)",
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  return result?.result?.value || null;
+}
+
+async function waitForRewrittenThreadListRequest(client) {
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  let lastInfo = null;
+
+  while (Date.now() < deadline) {
+    try {
+      lastInfo = await readRuntimePatchInfo(client);
+      if (
+        lastInfo?.limit === THREAD_LIMIT &&
+        lastInfo?.patchKind === "router-dispatch-rewrite" &&
+        lastInfo?.installed === true &&
+        lastInfo?.rewriteCount > 0
+      ) {
+        return lastInfo;
+      }
+    } catch {
+      // The page may be between execution contexts while reloading.
+    }
+
+    await sleep(250);
+  }
+
+  throw new Error(
+    `Failed to observe rewritten thread/list request after startup reload (lastInfo=${JSON.stringify(
+      lastInfo,
+    )})`,
+  );
+}
+
+async function injectPatch(compatibility) {
   const target = await waitForTarget();
   const client = await createCdpClient(target.webSocketDebuggerUrl);
-  const { asarPath, urls: candidateAssetUrls } =
-    getCandidateAppServerManagerAssetUrls();
+  const patchSource = buildRouterDispatchPatchSource(
+    compatibility.vscodeApiUrl,
+  );
 
   try {
     await client.send("Runtime.enable");
-    log("INFO", "installing runtime prototype patch", {
-      asarPath,
-      candidateAssetUrls,
+    await client.send("Page.enable");
+    log("INFO", "installing router dispatch patch", {
+      asarPath: compatibility.asarPath,
+      vscodeApiUrl: compatibility.vscodeApiUrl,
+      appServerManagerAssets: compatibility.appServerManagerAssets,
     });
 
-    for (const url of candidateAssetUrls) {
-      const result = await client.send("Runtime.evaluate", {
-        expression: buildRuntimePrototypePatchExpression(url),
-        awaitPromise: true,
-        returnByValue: true,
-      });
+    await client.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: patchSource,
+    });
+    const immediateResult = await client.send("Runtime.evaluate", {
+      expression: patchSource,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    log("INFO", "installed patch hook on current page", {
+      result: immediateResult?.result?.value || null,
+    });
 
-      const value = result?.result?.value || null;
-      if (value?.limit === THREAD_LIMIT && value?.patchedManagers?.length > 0) {
-        log("INFO", "installed runtime recent-conversation patch", value);
-        return {
-          patchedUrl: value.url,
-          limit: value.limit,
-          patchKind: value.patchKind,
-          patchedManagers: value.patchedManagers,
-        };
-      }
-
-      log("INFO", "candidate asset did not expose patch target", {
-        url,
-        result: value,
-      });
-    }
-
-    const result = await client.send("Runtime.evaluate", {
-      expression: "window.__codexAllThreadsPatchInfo ?? null",
+    await client.send("Runtime.evaluate", {
+      expression: "window.location.reload()",
       awaitPromise: false,
       returnByValue: true,
     });
-    const value = result?.result?.value || null;
-    if (value?.limit === THREAD_LIMIT && value?.patchedManagers?.length > 0) {
-      return {
-        patchedUrl: value.url,
-        limit: value.limit,
-        patchKind: value.patchKind,
-        patchedManagers: value.patchedManagers,
-      };
-    }
+    log("INFO", "sent Codex page reload to apply startup request patch");
 
-    throw new Error("Failed to install runtime recent-conversation patch");
+    const value = await waitForRewrittenThreadListRequest(client);
+    log("INFO", "observed rewritten recent-conversation request", value);
+
+    return {
+      patchedUrl: compatibility.vscodeApiUrl,
+      limit: value.limit,
+      patchKind: value.patchKind,
+      rewriteCount: value.rewriteCount,
+      lastRewrite: value.lastRewrite,
+      routerExportKey: value.routerExportKey,
+    };
   } finally {
     client.close();
   }
 }
 
 async function main() {
+  const compatibility = getPatchCompatibilityInfo();
+  log("INFO", "validated Codex patch compatibility", compatibility);
+
   const child = launchCodex();
   const removeTerminationHandlers = installTerminationHandlers(child);
 
   try {
-    const result = await injectPatch();
+    const result = await injectPatch(compatibility);
     log("INFO", "Codex launched with one-shot thread list patch", {
       limit: result.limit,
       proxy: PROXY || null,
       url: result.patchedUrl,
       patchKind: result.patchKind,
-      patchedManagers: result.patchedManagers,
+      rewriteCount: result.rewriteCount,
+      lastRewrite: result.lastRewrite,
+      routerExportKey: result.routerExportKey,
     });
     console.log(
-      `Codex launched with one-shot thread list patch. limit=${result.limit} proxy=${PROXY || "disabled"} url=${result.patchedUrl}`,
+      `Codex launched with one-shot thread list patch. limit=${result.limit} proxy=${PROXY || "disabled"} patch=${result.patchKind} rewriteCount=${result.rewriteCount}`,
     );
     if (!BACKGROUND) {
       log("INFO", "Codex is running in foreground; terminal will stay attached", {
