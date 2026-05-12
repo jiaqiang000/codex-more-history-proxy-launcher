@@ -16,6 +16,7 @@ Codex 聊天记录，Codex 历史记录，Codex 只显示 50 条，Codex 显示 
 ## 能做什么
 
 - 把 Codex 侧边栏聊天记录从默认 50 个提高到 5000 个。
+- 兼容新版 Codex 对单次 `thread/list` 返回数量的限制：脚本会分页读取全部 active thread id，再调用 Codex 自己的 recent conversation 补载逻辑，避免项目分组里明明有历史线程却显示“暂无对话”。
 - 给 Codex 单独设置 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 等代理环境变量。
 - 只影响这次脚本启动出来的 Codex，不污染当前终端，也不永久修改系统代理。
 - 默认前台启动，终端会一直挂着并继续显示 Codex 日志，这样能直观看到这次启动的代理环境还跟着 Codex 进程在跑。
@@ -25,7 +26,7 @@ Codex 聊天记录，Codex 历史记录，Codex 只显示 50 条，Codex 显示 
 ## 文件说明
 
 - `launch_codex_with_proxy_and_all_threads.sh`：入口脚本，负责设置代理环境变量，然后启动真正的 Node.js launcher。
-- `launch_codex_all_threads.js`：负责启动 Codex、连接 Electron DevTools Protocol，并在页面启动时把 `thread/list` 请求里的 `limit` 从 50 改成 5000。
+- `launch_codex_all_threads.js`：负责启动 Codex、连接 Electron DevTools Protocol，放大 `thread/list` limit，并在新版 Codex 返回分页数据时主动补载全部 recent conversations。
 
 ## 使用方式
 

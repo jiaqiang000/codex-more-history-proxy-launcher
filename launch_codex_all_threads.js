@@ -104,7 +104,9 @@ function getPatchCompatibilityInfo() {
   let hasMcpRequest = false;
   let hasSendMessageFromView = false;
   let hasThreadList = false;
+  let hasLoadRecentConversationIds = false;
   let vscodeApiAssetPath = null;
+  let appServerManagerSignalsAssetPath = null;
 
   walkAsarFiles(asar.header, (filePath, node) => {
     if (!/^webview\/assets\/.*\.js$/.test(filePath)) {
@@ -118,11 +120,17 @@ function getPatchCompatibilityInfo() {
     if (/^webview\/assets\/app-server-manager-.*\.js$/.test(filePath)) {
       appServerManagerAssets.push(filePath);
     }
+    if (/^webview\/assets\/app-server-manager-signals-.*\.js$/.test(filePath)) {
+      appServerManagerSignalsAssetPath = filePath;
+    }
 
     const text = readAsarText(asar, filePath, node);
     hasMcpRequest ||= text.includes("mcp-request");
     hasSendMessageFromView ||= text.includes("sendMessageFromView");
     hasThreadList ||= text.includes("thread/list");
+    hasLoadRecentConversationIds ||= text.includes(
+      "load-recent-conversation-ids-for-host",
+    );
   });
 
   const missing = [];
@@ -141,6 +149,12 @@ function getPatchCompatibilityInfo() {
   if (appServerManagerAssets.length === 0) {
     missing.push("app-server-manager asset");
   }
+  if (!appServerManagerSignalsAssetPath) {
+    missing.push("app-server-manager-signals asset");
+  }
+  if (!hasLoadRecentConversationIds) {
+    missing.push("load-recent-conversation-ids-for-host action");
+  }
 
   if (missing.length > 0) {
     throw new Error(
@@ -153,6 +167,10 @@ function getPatchCompatibilityInfo() {
     checkedAssetCount,
     appServerManagerAssets,
     vscodeApiUrl: `app://-/${vscodeApiAssetPath.replace(/^webview\//, "")}`,
+    appServerManagerSignalsUrl: `app://-/${appServerManagerSignalsAssetPath.replace(
+      /^webview\//,
+      "",
+    )}`,
   };
 }
 
@@ -429,41 +447,189 @@ function createCdpClient(wsUrl) {
   });
 }
 
-function buildRouterDispatchPatchSource(vscodeApiUrl) {
+function buildRouterDispatchPatchSource(vscodeApiUrl, appServerManagerSignalsUrl) {
   return `
 (() => {
   const limit = ${THREAD_LIMIT};
   const apiUrl = ${JSON.stringify(vscodeApiUrl)};
+  const appServerManagerSignalsUrl = ${JSON.stringify(appServerManagerSignalsUrl)};
+  const patchKind = "router-dispatch-paginate";
   const stateKey = "__codexAllThreadsPatchInfo";
-  const existing = window[stateKey];
-  if (
-    existing?.limit === limit &&
-    existing?.patchKind === "router-dispatch-rewrite"
-  ) {
-    return existing;
-  }
-
   const info = {
     limit,
-    patchKind: "router-dispatch-rewrite",
+    patchKind,
     apiUrl,
     installed: false,
     installError: null,
     installAttempts: 0,
     rewriteCount: 0,
     lastRewrite: null,
+    observedThreadListResponseCount: 0,
+    deliveredThreadListCount: 0,
+    aggregatedResponseCount: 0,
+    internalPageRequestCount: 0,
+    internalPageResponseCount: 0,
+    internalPageErrorCount: 0,
+    forceLoadState: "idle",
+    forceLoadRequestCount: 0,
+    forceLoadLoadedCount: 0,
+    forceLoadMissingCount: null,
+    forceLoadError: null,
+    lastForceLoad: null,
+    manualLoadState: "idle",
+    manualLoadError: null,
+    lastManualLoad: null,
+    lastAggregation: null,
+    lastDelivery: null,
     routerExportKey: null,
   };
   window[stateKey] = info;
 
-  const rewritePayload = (type, payload) => {
+  const trackedRequests = new Map();
+  const internalResolvers = new Map();
+  let forceLoadScheduled = false;
+  let manualLoadStarted = false;
+
+  const getMessageId = (payload) => payload?.message?.id;
+  const getResultValue = (payload) => {
+    const result = payload?.message?.result;
+    if (result == null) {
+      return null;
+    }
+    return Object.prototype.hasOwnProperty.call(result, "value")
+      ? result.value
+      : result;
+  };
+  const isThreadListValue = (value) =>
+    value != null &&
+    typeof value === "object" &&
+    Array.isArray(value.data) &&
+    Object.prototype.hasOwnProperty.call(value, "nextCursor");
+
+  const clonePayloadWithValue = (payload, value) => {
+    const result = payload.message.result;
+    const nextResult =
+      result != null &&
+      typeof result === "object" &&
+      Object.prototype.hasOwnProperty.call(result, "value")
+        ? {
+            ...result,
+            value,
+          }
+        : value;
+
+    return {
+      ...payload,
+      message: {
+        ...payload.message,
+        result: nextResult,
+      },
+    };
+  };
+
+  const rememberDelivery = (requestId, value, details) => {
+    info.deliveredThreadListCount += 1;
+    info.lastDelivery = {
+      requestId: String(requestId || ""),
+      total: Array.isArray(value?.data) ? value.data.length : null,
+      nextCursor: value?.nextCursor ?? null,
+      at: new Date().toISOString(),
+      ...details,
+    };
+  };
+
+  const uniqueThreadIds = (items) => {
+    const ids = [];
+    const seen = new Set();
+    for (const item of items || []) {
+      const id = item?.id;
+      if (typeof id !== "string" || id.length === 0 || seen.has(id)) {
+        continue;
+      }
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
+  };
+
+  const forceLoadRecentConversationIds = async (items) => {
+    if (forceLoadScheduled) {
+      return;
+    }
+
+    const conversationIds = uniqueThreadIds(items);
+    if (conversationIds.length === 0) {
+      info.forceLoadState = "completed";
+      info.lastForceLoad = {
+        totalIds: 0,
+        loaded: 0,
+        missing: 0,
+        at: new Date().toISOString(),
+      };
+      return;
+    }
+
+    forceLoadScheduled = true;
+    info.forceLoadState = "scheduled";
+    info.lastForceLoad = {
+      totalIds: conversationIds.length,
+      loaded: 0,
+      missing: conversationIds.length,
+      at: new Date().toISOString(),
+    };
+
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+
+    info.forceLoadState = "running";
+    info.forceLoadRequestCount += 1;
+    try {
+      const signals = await import(appServerManagerSignalsUrl);
+      if (typeof signals.rn !== "function") {
+        throw new Error("Codex app action dispatcher export was not found");
+      }
+
+      const loaded = await signals.rn("load-recent-conversation-ids-for-host", {
+        hostId: "local",
+        conversationIds,
+      });
+      const loadedIds = Array.isArray(loaded) ? loaded : [];
+      const loadedSet = new Set(loadedIds);
+      const missing = conversationIds.filter((id) => !loadedSet.has(id));
+      info.forceLoadState = missing.length === 0 ? "completed" : "failed";
+      info.forceLoadLoadedCount = loadedIds.length;
+      info.forceLoadMissingCount = missing.length;
+      info.forceLoadError =
+        missing.length === 0
+          ? null
+          : \`Codex only loaded \${loadedIds.length}/\${conversationIds.length} recent conversations\`;
+      info.lastForceLoad = {
+        totalIds: conversationIds.length,
+        loaded: loadedIds.length,
+        missing: missing.length,
+        missingSample: missing.slice(0, 10),
+        at: new Date().toISOString(),
+      };
+    } catch (error) {
+      info.forceLoadState = "failed";
+      info.forceLoadError = String(error?.message || error);
+      info.lastForceLoad = {
+        totalIds: conversationIds.length,
+        loaded: info.forceLoadLoadedCount,
+        missing: conversationIds.length,
+        error: info.forceLoadError,
+        at: new Date().toISOString(),
+      };
+    }
+  };
+
+  const shouldTrackRequest = (type, payload) => {
     if (type !== "mcp-request") {
-      return payload;
+      return false;
     }
 
     const request = payload?.request;
     if (request?.method !== "thread/list") {
-      return payload;
+      return false;
     }
 
     const params = request.params;
@@ -472,8 +638,19 @@ function buildRouterDispatchPatchSource(vscodeApiUrl) {
       typeof params !== "object" ||
       params.archived !== false
     ) {
+      return false;
+    }
+
+    return !internalResolvers.has(request.id);
+  };
+
+  const rewritePayload = (type, payload) => {
+    if (!shouldTrackRequest(type, payload)) {
       return payload;
     }
+
+    const request = payload.request;
+    const params = request.params;
 
     const currentLimit = Number(params.limit);
     if (
@@ -481,6 +658,11 @@ function buildRouterDispatchPatchSource(vscodeApiUrl) {
       currentLimit <= 0 ||
       currentLimit >= limit
     ) {
+      trackedRequests.set(request.id, {
+        hostId: payload.hostId,
+        params: { ...params, limit },
+        requestedLimit: limit,
+      });
       return payload;
     }
 
@@ -502,6 +684,11 @@ function buildRouterDispatchPatchSource(vscodeApiUrl) {
       to: limit,
       at: new Date().toISOString(),
     };
+    trackedRequests.set(request.id, {
+      hostId: payload.hostId,
+      params: nextPayload.request.params,
+      requestedLimit: limit,
+    });
     return nextPayload;
   };
   window.__codexAllThreadsRewritePayload = rewritePayload;
@@ -534,13 +721,214 @@ function buildRouterDispatchPatchSource(vscodeApiUrl) {
         throw new Error("Codex message router export was not found");
       }
 
-      if (router.dispatchMessage.__codexAllThreadsPatched === limit) {
+      if (
+        router.dispatchMessage.__codexAllThreadsPatched === limit &&
+        router.deliverMessage.__codexAllThreadsPatched === limit &&
+        router.__codexAllThreadsPatchKind === patchKind
+      ) {
         info.installed = true;
         info.routerExportKey = routerExportKey;
         return info;
       }
 
       const original = router.dispatchMessage;
+      const originalDeliver = router.deliverMessage;
+
+      const sendInternalThreadListPage = (hostId, params) => {
+        const requestId = crypto.randomUUID();
+        info.internalPageRequestCount += 1;
+
+        return new Promise((resolve) => {
+          const timer = window.setTimeout(() => {
+            internalResolvers.delete(requestId);
+            info.internalPageErrorCount += 1;
+            resolve({
+              ok: false,
+              error: "Timed out waiting for internal thread/list page",
+            });
+          }, 15000);
+
+          internalResolvers.set(requestId, {
+            resolve,
+            timer,
+          });
+
+          original.call(router, "mcp-request", {
+            hostId,
+            request: {
+              id: requestId,
+              method: "thread/list",
+              params,
+            },
+          });
+        });
+      };
+
+      const readAllRecentThreadPages = async () => {
+        const seenIds = new Set();
+        const merged = [];
+        const addPage = (items) => {
+          for (const item of items) {
+            if (item?.id == null || seenIds.has(item.id)) {
+              continue;
+            }
+            seenIds.add(item.id);
+            merged.push(item);
+          }
+        };
+
+        let pages = 0;
+        let nextCursor = null;
+        do {
+          const response = await sendInternalThreadListPage("local", {
+            limit,
+            cursor: nextCursor,
+            sortKey: "updated_at",
+            modelProviders: null,
+            archived: false,
+            sourceKinds: ["vscode"],
+          });
+
+          if (!response.ok || !isThreadListValue(response.value)) {
+            throw new Error(
+              response.error || "Manual thread/list response shape changed",
+            );
+          }
+
+          pages += 1;
+          addPage(response.value.data);
+          nextCursor = response.value.nextCursor ?? null;
+        } while (nextCursor != null && merged.length < limit && pages < 100);
+
+        return {
+          data: merged,
+          nextCursor,
+          pages,
+        };
+      };
+
+      window.__codexAllThreadsLoadAllRecentConversations = async () => {
+        if (forceLoadScheduled || manualLoadStarted) {
+          return info;
+        }
+
+        manualLoadStarted = true;
+        info.manualLoadState = "running";
+        info.manualLoadError = null;
+        info.lastManualLoad = {
+          total: 0,
+          pages: 0,
+          nextCursor: null,
+          at: new Date().toISOString(),
+        };
+
+        try {
+          const value = await readAllRecentThreadPages();
+          info.manualLoadState = "completed";
+          info.lastManualLoad = {
+            total: value.data.length,
+            pages: value.pages,
+            nextCursor: value.nextCursor,
+            at: new Date().toISOString(),
+          };
+          await forceLoadRecentConversationIds(value.data);
+        } catch (error) {
+          info.manualLoadState = "failed";
+          info.manualLoadError = String(error?.message || error);
+          info.lastManualLoad = {
+            ...(info.lastManualLoad || {}),
+            error: info.manualLoadError,
+            at: new Date().toISOString(),
+          };
+        }
+
+        return info;
+      };
+
+      const aggregateAndDeliver = async (
+        thisArg,
+        type,
+        payload,
+        tracked,
+        firstValue,
+        rest,
+      ) => {
+        const seenIds = new Set();
+        const merged = [];
+        const addPage = (items) => {
+          for (const item of items) {
+            if (item?.id == null || seenIds.has(item.id)) {
+              continue;
+            }
+            seenIds.add(item.id);
+            merged.push(item);
+          }
+        };
+
+        let nextCursor = firstValue.nextCursor ?? null;
+        let pages = 1;
+        addPage(firstValue.data);
+
+        while (nextCursor != null && merged.length < limit && pages < 100) {
+          const response = await sendInternalThreadListPage(tracked.hostId, {
+            ...tracked.params,
+            cursor: nextCursor,
+            limit,
+          });
+
+          if (!response.ok) {
+            info.lastAggregation = {
+              requestId: String(getMessageId(payload) || ""),
+              pages,
+              total: merged.length,
+              nextCursor,
+              error: response.error,
+              at: new Date().toISOString(),
+            };
+            break;
+          }
+
+          const value = response.value;
+          if (!isThreadListValue(value)) {
+            info.internalPageErrorCount += 1;
+            info.lastAggregation = {
+              requestId: String(getMessageId(payload) || ""),
+              pages,
+              total: merged.length,
+              nextCursor,
+              error: "Internal thread/list page response shape changed",
+              at: new Date().toISOString(),
+            };
+            break;
+          }
+
+          pages += 1;
+          addPage(value.data);
+          nextCursor = value.nextCursor ?? null;
+        }
+
+        const aggregatedValue = {
+          ...firstValue,
+          data: merged,
+          nextCursor: nextCursor ?? null,
+        };
+        const nextPayload = clonePayloadWithValue(payload, aggregatedValue);
+        info.aggregatedResponseCount += 1;
+        info.lastAggregation = {
+          requestId: String(getMessageId(payload) || ""),
+          pages,
+          total: merged.length,
+          nextCursor: aggregatedValue.nextCursor,
+          at: new Date().toISOString(),
+        };
+        rememberDelivery(getMessageId(payload), aggregatedValue, {
+          pages,
+          aggregated: true,
+        });
+        originalDeliver.call(thisArg, type, nextPayload, ...rest);
+        forceLoadRecentConversationIds(aggregatedValue.data);
+      };
+
       const wrapped = function codexAllThreadsDispatchMessage(
         type,
         payload,
@@ -557,6 +945,70 @@ function buildRouterDispatchPatchSource(vscodeApiUrl) {
         configurable: true,
       });
       router.dispatchMessage = wrapped;
+
+      const wrappedDeliver = function codexAllThreadsDeliverMessage(
+        type,
+        payload,
+        ...rest
+      ) {
+        if (type === "mcp-response") {
+          const responseId = getMessageId(payload);
+          const internal = internalResolvers.get(responseId);
+          if (internal != null) {
+            internalResolvers.delete(responseId);
+            window.clearTimeout(internal.timer);
+            info.internalPageResponseCount += 1;
+            const value = getResultValue(payload);
+            internal.resolve({
+              ok: isThreadListValue(value),
+              value,
+              error: isThreadListValue(value)
+                ? null
+                : "Internal thread/list response did not contain data",
+            });
+            return;
+          }
+
+          const tracked = trackedRequests.get(responseId);
+          if (tracked != null) {
+            trackedRequests.delete(responseId);
+            info.observedThreadListResponseCount += 1;
+
+            const value = getResultValue(payload);
+            if (!isThreadListValue(value)) {
+              return originalDeliver.call(this, type, payload, ...rest);
+            }
+
+            if (value.nextCursor == null || value.data.length >= limit) {
+              rememberDelivery(responseId, value, {
+                pages: 1,
+                aggregated: false,
+              });
+              return originalDeliver.call(this, type, payload, ...rest);
+            }
+
+            rememberDelivery(responseId, value, {
+              pages: 1,
+              aggregated: false,
+              hasMore: true,
+            });
+            originalDeliver.call(this, type, payload, ...rest);
+            return;
+          }
+        }
+
+        return originalDeliver.call(this, type, payload, ...rest);
+      };
+      Object.defineProperty(wrappedDeliver, "__codexAllThreadsPatched", {
+        value: limit,
+        configurable: true,
+      });
+      Object.defineProperty(wrappedDeliver, "__codexAllThreadsOriginal", {
+        value: originalDeliver,
+        configurable: true,
+      });
+      router.deliverMessage = wrappedDeliver;
+      router.__codexAllThreadsPatchKind = patchKind;
 
       info.installed = true;
       info.installedAt = new Date().toISOString();
@@ -584,7 +1036,7 @@ async function readRuntimePatchInfo(client) {
   return result?.result?.value || null;
 }
 
-async function waitForRewrittenThreadListRequest(client) {
+async function waitForPatchInstalled(client) {
   const deadline = Date.now() + START_TIMEOUT_MS;
   let lastInfo = null;
 
@@ -593,9 +1045,8 @@ async function waitForRewrittenThreadListRequest(client) {
       lastInfo = await readRuntimePatchInfo(client);
       if (
         lastInfo?.limit === THREAD_LIMIT &&
-        lastInfo?.patchKind === "router-dispatch-rewrite" &&
-        lastInfo?.installed === true &&
-        lastInfo?.rewriteCount > 0
+        lastInfo?.patchKind === "router-dispatch-paginate" &&
+        lastInfo?.installed === true
       ) {
         return lastInfo;
       }
@@ -607,7 +1058,57 @@ async function waitForRewrittenThreadListRequest(client) {
   }
 
   throw new Error(
-    `Failed to observe rewritten thread/list request after startup reload (lastInfo=${JSON.stringify(
+    `Failed to install expanded thread/list patch after startup reload (lastInfo=${JSON.stringify(
+      lastInfo,
+    )})`,
+  );
+}
+
+async function waitForExpandedThreadListResponse(client) {
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  let lastInfo = null;
+
+  while (Date.now() < deadline) {
+    try {
+      lastInfo = await readRuntimePatchInfo(client);
+      if (
+        lastInfo?.limit === THREAD_LIMIT &&
+        lastInfo?.patchKind === "router-dispatch-paginate" &&
+        lastInfo?.installed === true &&
+        (lastInfo?.lastDelivery != null ||
+          lastInfo?.manualLoadState === "completed") &&
+        (lastInfo?.lastDelivery == null ||
+          lastInfo.lastDelivery.nextCursor == null ||
+          lastInfo.lastDelivery.total >= THREAD_LIMIT) &&
+        lastInfo?.forceLoadState === "completed"
+      ) {
+        return lastInfo;
+      }
+
+      if (lastInfo?.forceLoadState === "failed") {
+        throw new Error(
+          `Failed to force-load recent conversations after pagination (lastInfo=${JSON.stringify(
+            lastInfo,
+          )})`,
+        );
+      }
+
+      if (lastInfo?.manualLoadState === "failed") {
+        throw new Error(
+          `Failed to manually load recent conversations after startup reload (lastInfo=${JSON.stringify(
+            lastInfo,
+          )})`,
+        );
+      }
+    } catch {
+      // The page may be between execution contexts while reloading.
+    }
+
+    await sleep(250);
+  }
+
+  throw new Error(
+    `Failed to observe expanded thread/list response after startup reload (lastInfo=${JSON.stringify(
       lastInfo,
     )})`,
   );
@@ -618,6 +1119,7 @@ async function injectPatch(compatibility) {
   const client = await createCdpClient(target.webSocketDebuggerUrl);
   const patchSource = buildRouterDispatchPatchSource(
     compatibility.vscodeApiUrl,
+    compatibility.appServerManagerSignalsUrl,
   );
 
   try {
@@ -626,6 +1128,7 @@ async function injectPatch(compatibility) {
     log("INFO", "installing router dispatch patch", {
       asarPath: compatibility.asarPath,
       vscodeApiUrl: compatibility.vscodeApiUrl,
+      appServerManagerSignalsUrl: compatibility.appServerManagerSignalsUrl,
       appServerManagerAssets: compatibility.appServerManagerAssets,
     });
 
@@ -648,14 +1151,33 @@ async function injectPatch(compatibility) {
     });
     log("INFO", "sent Codex page reload to apply startup request patch");
 
-    const value = await waitForRewrittenThreadListRequest(client);
-    log("INFO", "observed rewritten recent-conversation request", value);
+    await waitForPatchInstalled(client);
+    await client.send("Runtime.evaluate", {
+      expression:
+        "window.setTimeout(() => { window.__codexAllThreadsLoadAllRecentConversations?.().catch(() => null); }, 2500); true",
+      awaitPromise: false,
+      returnByValue: true,
+    });
+    log("INFO", "triggered manual recent-conversation force load");
+
+    const value = await waitForExpandedThreadListResponse(client);
+    log("INFO", "observed expanded recent-conversation response", value);
 
     return {
       patchedUrl: compatibility.vscodeApiUrl,
       limit: value.limit,
       patchKind: value.patchKind,
       rewriteCount: value.rewriteCount,
+      aggregatedResponseCount: value.aggregatedResponseCount,
+      deliveredThreadListCount: value.deliveredThreadListCount,
+      forceLoadState: value.forceLoadState,
+      forceLoadLoadedCount: value.forceLoadLoadedCount,
+      forceLoadMissingCount: value.forceLoadMissingCount,
+      lastForceLoad: value.lastForceLoad,
+      manualLoadState: value.manualLoadState,
+      lastManualLoad: value.lastManualLoad,
+      lastAggregation: value.lastAggregation,
+      lastDelivery: value.lastDelivery,
       lastRewrite: value.lastRewrite,
       routerExportKey: value.routerExportKey,
     };
@@ -673,17 +1195,27 @@ async function main() {
 
   try {
     const result = await injectPatch(compatibility);
-    log("INFO", "Codex launched with one-shot thread list patch", {
+    log("INFO", "Codex launched with paginated thread list patch", {
       limit: result.limit,
       proxy: PROXY || null,
       url: result.patchedUrl,
       patchKind: result.patchKind,
       rewriteCount: result.rewriteCount,
+      aggregatedResponseCount: result.aggregatedResponseCount,
+      deliveredThreadListCount: result.deliveredThreadListCount,
+      forceLoadState: result.forceLoadState,
+      forceLoadLoadedCount: result.forceLoadLoadedCount,
+      forceLoadMissingCount: result.forceLoadMissingCount,
+      lastForceLoad: result.lastForceLoad,
+      manualLoadState: result.manualLoadState,
+      lastManualLoad: result.lastManualLoad,
+      lastAggregation: result.lastAggregation,
+      lastDelivery: result.lastDelivery,
       lastRewrite: result.lastRewrite,
       routerExportKey: result.routerExportKey,
     });
     console.log(
-      `Codex launched with one-shot thread list patch. limit=${result.limit} proxy=${PROXY || "disabled"} patch=${result.patchKind} rewriteCount=${result.rewriteCount}`,
+      `Codex launched with paginated thread list patch. limit=${result.limit} proxy=${PROXY || "disabled"} patch=${result.patchKind} loaded=${result.forceLoadLoadedCount ?? result.lastDelivery?.total ?? "unknown"} pages=${result.lastManualLoad?.pages ?? result.lastDelivery?.pages ?? "unknown"}`,
     );
     if (!BACKGROUND) {
       log("INFO", "Codex is running in foreground; terminal will stay attached", {
