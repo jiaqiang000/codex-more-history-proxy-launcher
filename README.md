@@ -17,6 +17,7 @@ Codex 聊天记录，Codex 历史记录，Codex 只显示 50 条，Codex 显示 
 
 - 把 Codex 侧边栏聊天记录从默认 50 个提高到 5000 个。
 - 兼容新版 Codex 对单次 `thread/list` 返回数量的限制：脚本会分页读取全部 active thread id，再调用 Codex 自己的 recent conversation 补载逻辑，避免项目分组里明明有历史线程却显示“暂无对话”。
+- 启动时会读取 Codex 自己的 `app_state_snapshot` 做校验，确认 recent conversations 已经真的加载到完整数量；如果只是请求读到了但侧边栏 store 没更新，脚本会失败退出。
 - 给 Codex 单独设置 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 等代理环境变量。
 - 只影响这次脚本启动出来的 Codex，不污染当前终端，也不永久修改系统代理。
 - 默认前台启动，终端会一直挂着并继续显示 Codex 日志，这样能直观看到这次启动的代理环境还跟着 Codex 进程在跑。
@@ -85,5 +86,7 @@ bash ./launch_codex_with_proxy_and_all_threads.sh
 这个脚本依赖 Codex 桌面端内部前端实现。Codex 更新后，如果前端消息路由或 `thread/list` 请求结构变化，脚本也可能需要跟着调整。
 
 脚本的策略是：如果补丁装不上，就直接退出并关闭这次启动的 Codex。这样至少不会因为脚本问题导致后续状态乱掉。
+
+最近一次适配点：新版 Codex 的 app action dispatcher 导出名发生变化，脚本现在会动态识别真正走 `sendRequest` 的 dispatcher，再执行 recent conversation 补载和启动校验。
 
 本项目不是 OpenAI 官方项目。

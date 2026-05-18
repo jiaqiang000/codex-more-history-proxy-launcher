@@ -2,6 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const net = require("net");
 const { spawn } = require("child_process");
 
 const APP_BIN =
@@ -54,6 +55,27 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isTcpPortOpen(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+
+    const finish = (isOpen) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(isOpen);
+    };
+
+    socket.setTimeout(500);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
+}
+
 function getAppAsarPath() {
   return (
     process.env.CODEX_APP_ASAR ||
@@ -104,7 +126,6 @@ function getPatchCompatibilityInfo() {
   let hasMcpRequest = false;
   let hasSendMessageFromView = false;
   let hasThreadList = false;
-  let hasLoadRecentConversationIds = false;
   let vscodeApiAssetPath = null;
   let appServerManagerSignalsAssetPath = null;
 
@@ -128,9 +149,6 @@ function getPatchCompatibilityInfo() {
     hasMcpRequest ||= text.includes("mcp-request");
     hasSendMessageFromView ||= text.includes("sendMessageFromView");
     hasThreadList ||= text.includes("thread/list");
-    hasLoadRecentConversationIds ||= text.includes(
-      "load-recent-conversation-ids-for-host",
-    );
   });
 
   const missing = [];
@@ -152,10 +170,6 @@ function getPatchCompatibilityInfo() {
   if (!appServerManagerSignalsAssetPath) {
     missing.push("app-server-manager-signals asset");
   }
-  if (!hasLoadRecentConversationIds) {
-    missing.push("load-recent-conversation-ids-for-host action");
-  }
-
   if (missing.length > 0) {
     throw new Error(
       `Codex app bundle no longer exposes expected patch surface: ${missing.join(", ")}`,
@@ -472,7 +486,7 @@ function buildRouterDispatchPatchSource(vscodeApiUrl, appServerManagerSignalsUrl
     internalPageErrorCount: 0,
     forceLoadState: "idle",
     forceLoadRequestCount: 0,
-    forceLoadLoadedCount: 0,
+    forceLoadLoadedCount: null,
     forceLoadMissingCount: null,
     forceLoadError: null,
     lastForceLoad: null,
@@ -481,6 +495,8 @@ function buildRouterDispatchPatchSource(vscodeApiUrl, appServerManagerSignalsUrl
     lastManualLoad: null,
     lastAggregation: null,
     lastDelivery: null,
+    lastSnapshot: null,
+    actionDispatcherExportKey: null,
     routerExportKey: null,
   };
   window[stateKey] = info;
@@ -552,6 +568,25 @@ function buildRouterDispatchPatchSource(vscodeApiUrl, appServerManagerSignalsUrl
     return ids;
   };
 
+  const getActionDispatcher = (signals) => {
+    for (const key of ["ln", "rn", "oa"]) {
+      const value = signals?.[key];
+      if (typeof value !== "function") {
+        continue;
+      }
+
+      const source = Function.prototype.toString.call(value);
+      if (!source.includes("sendRequest")) {
+        continue;
+      }
+
+      info.actionDispatcherExportKey = key;
+      return value;
+    }
+
+    return null;
+  };
+
   const forceLoadRecentConversationIds = async (items) => {
     if (forceLoadScheduled) {
       return;
@@ -584,14 +619,18 @@ function buildRouterDispatchPatchSource(vscodeApiUrl, appServerManagerSignalsUrl
     info.forceLoadRequestCount += 1;
     try {
       const signals = await import(appServerManagerSignalsUrl);
-      if (typeof signals.rn !== "function") {
+      const dispatchAction = getActionDispatcher(signals);
+      if (typeof dispatchAction !== "function") {
         throw new Error("Codex app action dispatcher export was not found");
       }
 
-      const loaded = await signals.rn("load-recent-conversation-ids-for-host", {
-        hostId: "local",
-        conversationIds,
-      });
+      const loaded = await dispatchAction(
+        "load-recent-conversation-ids-for-host",
+        {
+          hostId: "local",
+          conversationIds,
+        },
+      );
       const loadedIds = Array.isArray(loaded) ? loaded : [];
       const loadedSet = new Set(loadedIds);
       const missing = conversationIds.filter((id) => !loadedSet.has(id));
@@ -987,12 +1026,24 @@ function buildRouterDispatchPatchSource(vscodeApiUrl, appServerManagerSignalsUrl
               return originalDeliver.call(this, type, payload, ...rest);
             }
 
-            rememberDelivery(responseId, value, {
-              pages: 1,
-              aggregated: false,
-              hasMore: true,
-            });
-            originalDeliver.call(this, type, payload, ...rest);
+            aggregateAndDeliver(this, type, payload, tracked, value, rest).catch(
+              (error) => {
+                info.lastAggregation = {
+                  requestId: String(responseId || ""),
+                  pages: 1,
+                  total: Array.isArray(value.data) ? value.data.length : null,
+                  nextCursor: value.nextCursor ?? null,
+                  error: String(error?.message || error),
+                  at: new Date().toISOString(),
+                };
+                rememberDelivery(responseId, value, {
+                  pages: 1,
+                  aggregated: false,
+                  fallbackAfterAggregationError: true,
+                });
+                originalDeliver.call(this, type, payload, ...rest);
+              },
+            );
             return;
           }
         }
@@ -1036,6 +1087,86 @@ async function readRuntimePatchInfo(client) {
   return result?.result?.value || null;
 }
 
+async function readAppStateSnapshot(client, appServerManagerSignalsUrl) {
+  const result = await client.send("Runtime.evaluate", {
+    expression: `
+(async () => {
+  const signals = await import(${JSON.stringify(appServerManagerSignalsUrl)});
+  const dispatchAction = (() => {
+    for (const key of ["ln", "rn", "oa"]) {
+      const value = signals?.[key];
+      if (typeof value !== "function") {
+        continue;
+      }
+      const source = Function.prototype.toString.call(value);
+      if (source.includes("sendRequest")) {
+        if (window.__codexAllThreadsPatchInfo) {
+          window.__codexAllThreadsPatchInfo.actionDispatcherExportKey = key;
+        }
+        return value;
+      }
+    }
+    return null;
+  })();
+  if (typeof dispatchAction !== "function") {
+    throw new Error("Codex app action dispatcher export was not found");
+  }
+  const snapshot = await dispatchAction("collect-app-state-snapshot-for-host", {
+    hostId: "local",
+    reason: "codex-more-history-proxy-launcher",
+  });
+  if (window.__codexAllThreadsPatchInfo) {
+    window.__codexAllThreadsPatchInfo.lastSnapshot = snapshot;
+  }
+  return snapshot;
+})()
+`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+
+  if (result?.exceptionDetails) {
+    throw new Error(
+      result.exceptionDetails.text ||
+        result.exceptionDetails.exception?.description ||
+        "Failed to collect app state snapshot",
+    );
+  }
+
+  return result?.result?.value || null;
+}
+
+function getExpectedRecentConversationTotal(info) {
+  const candidates = [];
+
+  for (const value of [info?.lastAggregation, info?.lastDelivery]) {
+    if (
+      value != null &&
+      value.nextCursor == null &&
+      Number.isFinite(value.total) &&
+      value.total >= 0
+    ) {
+      candidates.push(value.total);
+    }
+  }
+
+  if (
+    info?.manualLoadState === "completed" &&
+    info.lastManualLoad != null &&
+    info.lastManualLoad.nextCursor == null &&
+    Number.isFinite(info.lastManualLoad.total) &&
+    info.lastManualLoad.total >= 0
+  ) {
+    candidates.push(info.lastManualLoad.total);
+  }
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  return Math.max(...candidates);
+}
+
 async function waitForPatchInstalled(client) {
   const deadline = Date.now() + START_TIMEOUT_MS;
   let lastInfo = null;
@@ -1064,41 +1195,35 @@ async function waitForPatchInstalled(client) {
   );
 }
 
-async function waitForExpandedThreadListResponse(client) {
+async function waitForExpandedThreadListResponse(
+  client,
+  appServerManagerSignalsUrl,
+) {
   const deadline = Date.now() + START_TIMEOUT_MS;
   let lastInfo = null;
+  let lastSnapshot = null;
 
   while (Date.now() < deadline) {
     try {
       lastInfo = await readRuntimePatchInfo(client);
+      const expectedTotal = getExpectedRecentConversationTotal(lastInfo);
       if (
         lastInfo?.limit === THREAD_LIMIT &&
         lastInfo?.patchKind === "router-dispatch-paginate" &&
         lastInfo?.installed === true &&
-        (lastInfo?.lastDelivery != null ||
-          lastInfo?.manualLoadState === "completed") &&
-        (lastInfo?.lastDelivery == null ||
-          lastInfo.lastDelivery.nextCursor == null ||
-          lastInfo.lastDelivery.total >= THREAD_LIMIT) &&
-        lastInfo?.forceLoadState === "completed"
+        expectedTotal != null
       ) {
-        return lastInfo;
-      }
-
-      if (lastInfo?.forceLoadState === "failed") {
-        throw new Error(
-          `Failed to force-load recent conversations after pagination (lastInfo=${JSON.stringify(
-            lastInfo,
-          )})`,
+        lastSnapshot = await readAppStateSnapshot(
+          client,
+          appServerManagerSignalsUrl,
         );
-      }
-
-      if (lastInfo?.manualLoadState === "failed") {
-        throw new Error(
-          `Failed to manually load recent conversations after startup reload (lastInfo=${JSON.stringify(
-            lastInfo,
-          )})`,
-        );
+        const loadedRecent = lastSnapshot?.thread_count_loaded_recent;
+        if (Number.isFinite(loadedRecent) && loadedRecent >= expectedTotal) {
+          return {
+            ...lastInfo,
+            lastSnapshot,
+          };
+        }
       }
     } catch {
       // The page may be between execution contexts while reloading.
@@ -1110,7 +1235,7 @@ async function waitForExpandedThreadListResponse(client) {
   throw new Error(
     `Failed to observe expanded thread/list response after startup reload (lastInfo=${JSON.stringify(
       lastInfo,
-    )})`,
+    )}, lastSnapshot=${JSON.stringify(lastSnapshot)})`,
   );
 }
 
@@ -1158,9 +1283,12 @@ async function injectPatch(compatibility) {
       awaitPromise: false,
       returnByValue: true,
     });
-    log("INFO", "triggered manual recent-conversation force load");
+    log("INFO", "triggered manual recent-conversation pagination check");
 
-    const value = await waitForExpandedThreadListResponse(client);
+    const value = await waitForExpandedThreadListResponse(
+      client,
+      compatibility.appServerManagerSignalsUrl,
+    );
     log("INFO", "observed expanded recent-conversation response", value);
 
     return {
@@ -1178,7 +1306,9 @@ async function injectPatch(compatibility) {
       lastManualLoad: value.lastManualLoad,
       lastAggregation: value.lastAggregation,
       lastDelivery: value.lastDelivery,
+      lastSnapshot: value.lastSnapshot,
       lastRewrite: value.lastRewrite,
+      actionDispatcherExportKey: value.actionDispatcherExportKey,
       routerExportKey: value.routerExportKey,
     };
   } finally {
@@ -1189,6 +1319,12 @@ async function injectPatch(compatibility) {
 async function main() {
   const compatibility = getPatchCompatibilityInfo();
   log("INFO", "validated Codex patch compatibility", compatibility);
+
+  if (await isTcpPortOpen(DEBUG_PORT)) {
+    throw new Error(
+      `Remote debugging port ${DEBUG_PORT} is already in use. Close the existing Codex debug instance or run with another port, for example: CODEX_REMOTE_DEBUG_PORT=9233 bash /Users/luojiaqiang/script/launch_codex_with_proxy_and_all_threads.sh`,
+    );
+  }
 
   const child = launchCodex();
   const removeTerminationHandlers = installTerminationHandlers(child);
@@ -1211,11 +1347,13 @@ async function main() {
       lastManualLoad: result.lastManualLoad,
       lastAggregation: result.lastAggregation,
       lastDelivery: result.lastDelivery,
+      lastSnapshot: result.lastSnapshot,
       lastRewrite: result.lastRewrite,
+      actionDispatcherExportKey: result.actionDispatcherExportKey,
       routerExportKey: result.routerExportKey,
     });
     console.log(
-      `Codex launched with paginated thread list patch. limit=${result.limit} proxy=${PROXY || "disabled"} patch=${result.patchKind} loaded=${result.forceLoadLoadedCount ?? result.lastDelivery?.total ?? "unknown"} pages=${result.lastManualLoad?.pages ?? result.lastDelivery?.pages ?? "unknown"}`,
+      `Codex launched with paginated thread list patch. limit=${result.limit} proxy=${PROXY || "disabled"} patch=${result.patchKind} loaded=${result.lastSnapshot?.thread_count_loaded_recent ?? result.lastAggregation?.total ?? result.lastDelivery?.total ?? "unknown"} pages=${result.lastAggregation?.pages ?? result.lastManualLoad?.pages ?? result.lastDelivery?.pages ?? "unknown"}`,
     );
     if (!BACKGROUND) {
       log("INFO", "Codex is running in foreground; terminal will stay attached", {
